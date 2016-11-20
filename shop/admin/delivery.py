@@ -135,3 +135,60 @@ class DeliveryInline(admin.TabularInline):
             return timezone.localtime(obj.fulfilled_at).ctime()
         return _("Pending")
     fulfilled.short_description = _("Fulfilled at")
+
+
+class DeliveryOrderAdminMixin(object):
+    def get_urls(self):
+        my_urls = [
+            url(r'^(?P<delivery_pk>\d+)/print/delivery_note/$', self.admin_site.admin_view(self.render_delivery_note),
+                name='print_delivery_note'), + super(DeliveryOrderAdminMixin, self).get_urls()]
+        return my_urls
+
+    def render_delivery_note(self, request, delivery_pk=None):
+        template = select_template([
+            '{}/print/delivery-note.html'.format(settings.SHOP_APP_LABEL.lower()),
+            'shop/print/delivery-note.html'
+            ])
+        delivery = DeliveryModel.objects.get(pk=delivery_pk)
+        context = {'request': request, 'render_label': 'print'}
+        order_serializer = serializers.OrderDetailSerializer(delivery.order, context=context)
+        content = template.render(RequestContext(request, {
+            'customer': serializers.CustomSerializer(delivery.order.customer).data,
+            'data': order_serializer.data,
+            'delivery': delivery,
+            }))
+        return HttpResponse(content)
+
+    def get_inline_instances(self, request, obj=None):
+        inline_instances = [OrderItemInlineDelivery(self.model, self.admin_site) if isinstance(instance, OrderItemInline) else instance
+            for instance in super(DeliveryOrderAdminMixin, self).get_inline_instances(request, obj)]
+        if obj.status in ('pick_goods', 'pack_goods'):
+            inline_instances.append(DeliveryInline(self.model, self.admin_site))
+        return inline_instances
+
+    def save_related(self, request, form, formset, change):
+        super(DeliveryOrderAdminMixin, self).save_related(request, form, formset, change)
+        if hasattr(form.instance, '_transition_to_pack_goods') or (form.instance.status == 'pick_goods' and 'status' not in form.changed_data):
+            self._mark_items_for_delivery(formsets)
+
+    def _mark_items_for_delivery(self, formsets):
+        orderitem_formset = [fs for fs in formsets if issubclass(fs.model, OrderItemModel)]
+        delivery_formset = [fs for fs in formsets if issubclass(fs.model, DeliveryModel)]
+        if orderitem_formset and delivery_formset:
+            orderitem_formset = orderitem_formset[0]
+            delivery_formset = delivery_formset[0]
+            if delivery_formset.new_objects:
+                delivery = delivery_formset.new_objects[0]
+            else:
+                delivery = delivery_formset.queryset.filter(fulfilled_at__isnull=True).last()
+            if delivery:
+                count_items = 0
+                for data in orderitem_formset.cleaned_data:
+                    if data['deliver_quantity'] > 0 and not data['cancelled']:
+                        DeliveryItemModel.objects.create(delivery=delivery, item=data['id'], quantity=data['deliver_quantity'])
+                        count_items += 1
+                if count_items > 0:
+                    delivery.fulfilled_at = timezone.now()
+                    delivery.save()
+                else:
+                    delivery.delete()
