@@ -103,3 +103,187 @@ class GuestFormPlugin(CustomerFormPluginBase):
 		return super(GuestFormPlugin, self).render(context, instance, placeholder)
 
 DialogFormPluginBase.register_plugin(GuestFormPlugin)
+
+
+class CheckoutAddressPluginBase(DialogFormPluginBase):
+	multi_addr = GlossaryField(
+		widgets.CheckboxInput(),
+		label=_("Multiple Addresses"),
+		initial=False,
+		help_text=_("Shall the customer be allowed to edit multiple addresses."),
+		)
+
+	def get_form_data(self, context, instance, placeholder):
+		form_data = super(CheckoutAddressPluginBase, self).get_form_data(context, instance, placeholder)
+		AddressModel = self.FormClass.get_model()
+		assert form_data['cart'] is not None, "Can not proceed to checkout without cart"
+		address = self.get_address(form_data['cart'])
+		form_data.update(instance=address)
+
+		if instance.glossary.get('multi_addr'):
+			addresses = AddressModel.objects.filter(customer=context['request'].customer).order_by('priority')
+			form_entities = [dict(value=str(addr.priority),
+				label="{}. {}".format(number, addr.as_text().replace('\n', ' – ')))	for number, addr in enumerate(addresses, 1)]
+			form_data.update(multi_addr=True, form_entities=form_entities)
+		else:
+			form_data.update(multi_addr=False)
+		return form_data
+
+
+class ShippingAddressFormPlugin(CheckoutAddressPluginBase):
+	name = _("Shipping Address Form")
+	form_class = 'shop.forms.checkout.ShippingAddressForm'
+	template_leaf_name = 'shipping-address-{}.html'
+
+	def get_address(self, cart):
+		if cart.shipping_address is None:
+			address = self.FormClass.get_model().objects.get_fallback(customer=cart.customer)
+			cart.shipping_address = address
+			cart.save()
+		return cart.shipping_address
+
+DialogFormPluginBase.register_plugin(ShippingAddressFormPlugin)
+
+
+class BillingAddressFormPlugin(CheckoutAddressPluginBase):
+	name = _("Billing Address Form")
+	form_class = 'shop.forms.checkout.BillingAddressForm'
+	template_leaf_name = 'billing-address-{}.html'
+	allow_use_shipping = GlossaryField(
+		widgets.CheckboxInput(),
+		label=_("Use shipping address"),
+		initial=True,
+		help_text=_("Allow the customer to use the shipping address for billing."),
+		)
+
+	def get_address(self, cart):
+		return cart.billing_address
+
+DialogFormPluginBase.register_plugin(BillingAddressFormPlugin)
+
+
+class PaymentMethodFormPlugin(DialogFormPluginBase):
+	name = _("Payment Method Form")
+	form_class = 'shop.forms.checkout.PaymentMethodForm'
+	template_leaf_name = 'payment-method-{}.html'
+
+	def get_form_data(self, context, instance, placeholder):
+		form_data = super(PaymentMethodFormPlugin, self).get_form_data(context, instance, placeholder)
+		cart = form_data.get('cart')
+		if cart:
+			form_data.update(initial={'payment_modifier': cart.extra.get('payment_modifier')})
+		return form_data
+
+	def render(self, context, instance, placeholder):
+		super(PaymentMethodFormPlugin, self).render(context, instance, placeholder)
+		for payment_modifier in cart_modifiers_pool.get_payment_modifiers():
+			payment_modifier.update_render_context(context)
+		return context
+
+if cart_modifiers_pool.get_payment_modifiers():
+	DialogFormPluginBase.register_plugin(PaymentMethodFormPlugin)
+
+
+class ShippingMethodFormPlugin(DialogFormPluginBase):
+	name = _("Shipping Method Form")
+	form_class = 'shop.forms.checkout.ShippingMethodForm'
+	template_leaf_name = 'shipping-method-{}.html'
+
+	def get_form_data(self, context, instance, placeholder):
+		form_data = super(ShippingMethodFormPlugin, self).get_form_data(context, instance, placeholder)
+		cart = form_data.get('cart')
+		if cart:
+			form_data.update(initial={'shipping_modifier': cart.extra.get('shipping_modifier')})
+		return form_data
+
+	def render(self, context, instance, placeholder):
+		super(ShippingMethodFormPlugin, self).render(context, instance, placeholder)
+		for shipping_modifier in cart_modifiers_pool.get_shipping_modifiers():
+			shipping_modifier.update_render_context(context)
+		return context
+
+if cart_modifiers_pool.get_shipping_modifiers():
+	DialogFormPluginBase.register_plugin(ShippingMethodFormPlugin)
+
+
+class ExtraAnnotationFormPlugin(DialogFormPluginBase):
+	name = _("Extra Annotation Form")
+	form_class = 'shop.forms.checkout.ExtraAnnotationForm'
+	template_leaf_name = 'extra-annotation-{}.html'
+
+	def get_form_data(self, context, instance, placeholder):
+		form_data = super(ExtraAnnotationFormPlugin, self).get_form_data(context, instance, placeholder)
+		cart = form_data.get('cart')
+		if cart:
+			form_data.update(initial={'annotation': cart.extra.get('annotation', '')})
+		return form_data
+
+DialogFormPluginBase.register_plugin(ExtraAnnotationFormPlugin)
+
+
+class AcceptConditionFormPlugin(DialogFormPluginBase):
+	name = _("Accept Condition")
+	form_class = 'shop.forms.checkout.AcceptConditionForm'
+	template_leaf_name = 'accept-condition.html'
+	html_parser = HTMLParser()
+	change_form_template = 'cascade/admin/text_plugin_change_form.html'
+
+	@classmethod
+	def get_identifier(cls, instance):
+		html_content = cls.html_parser.unescape(instance.glossary.get('html_content', ''))
+		html_content = strip_tags(html_content)
+		html_content = Truncator(html_content).words(3, truncate=' ...')
+		return mark_safe(html_content)
+
+	def get_form(self, request, obj=None, **kwargs):
+		if obj:
+			html_content = self.html_parser.unescape(obj.glossary.get('html_content', ''))
+			obj.glossary.update(html_content=html_content)
+			text_editor_widget = TextEditorWidget(installed_plugins=[TextLinkPlugin], pk=obj.pk,
+												placeholder=obj.placeholder, plugin_language=obj.language)
+			kwargs['glossary_fields'] = (
+				GlossaryField(
+					text_editor_widget,
+					label=_("HTML content"),
+					name='html_content',
+					))
+			return super(AcceptConditionFormPlugin, self).get_form(request, obj, **kwargs)
+
+	def render(self, context, instance, placeholder):
+		super(AcceptConditionFormPlugin, self).render(context, instance, placeholder)
+		accept_condition_form = context['accept_condition_form.plugin_{}'.format(instance.id)]
+		html_content = self.html_parser.unescape(instance.glossary.get('html_content', ''))
+		html_content = plugin_tags_to_user_html(html_content, context, placeholder)
+		accept_condition_form['accept'].field.widget.choice_label = mark_safe(html_content)
+		context['accept_condition_form'] = accept_condition_form
+		return context
+
+DialogFormPluginBase.register_plugin(AcceptConditionFormPlugin)
+
+
+class RequiredFormFieldsPlugin(ShopPluginBase):
+	name = _("Required Form Fields")
+	template_leaf_name = 'required-form-fields.html'
+
+	def get_render_template(self, context, instance, placeholder):
+		template_names = [
+			'{0}/checkout/{1}'.format(shop_settings.APP_LABEL, self.template_leaf_name),
+			'shop/checkout/{}'.format(self.template_leaf_name),
+			]
+		return select_template(template_names)
+
+plugin_pool.register_plugin(RequiredFormFieldsPlugin)
+
+
+class ValidateSetOfFormsPlugin(TransparentMixin, ShopPluginBase):
+	name = _("Validate Set of Forms")
+	allow_children = True
+	alien_child_classes = True
+
+	def get_render_template(self, context, instance, placeholder):
+		return select_template([
+			'{}/checkout/forms-set.html'.format(shop_settings.APP_LABEL),
+			'shop/checkout/forms-set.html',
+			])
+
+plugin_pool.register_plugin(ValidateSetOfFormsPlugin)
