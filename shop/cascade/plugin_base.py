@@ -1,0 +1,206 @@
+# -*- coding: utf-8 -*-
+from __future__ import unicode_literals
+
+
+from django import apps
+from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
+from django.forms import ChoiceField, widgets
+from django.template import TemplateDoesNotExist
+from django.template.loader import select_template
+from django.utils.html import format_html
+from django.utils.encoding import python_2_unicode_compatible
+from django.utils.module_loading import import_string
+from django.utils.translation import ugettext_lazy as _, pgettext_lazy
+from django.utils.safestring import mark_safe
+from cms.plugin_pool import plugin_pool
+from cmsplugin_cascade.fields import GlossaryField
+from cmsplugin_cascade.plugin_base import CascadePluginBase
+from cmsplugin_cascade.link.forms import LinkForm
+from cmsplugin_cascade.link.plugin_base import LinkPluginBase, LinkElementMixin
+from cmsplugin_cascade.utils import resolve_dependencies
+from django_select2.forms import HeavySelect2Widget
+from shop import settings as shop_settings
+from shop.forms.base import DialogFormMixin
+from shop.models.cart import CartModel
+from shop.models.product import ProductModel
+from shop.rest.serializers import ProductSelectSerializer
+
+
+class ShopPluginBase(CascadePluginBase):
+	module = _("Shop")
+	require_parent = False
+	allow_children = False
+
+
+@python_2_unicode_compatible
+class ShopLinkElementMixin(LinkElementMixin):
+	def __str__(self):
+		return self.plugin_class.get_identifier(self)
+
+
+class ShopLinkPluginBase(ShopPluginBase):
+	allow_children = False
+	parent_classes = []
+	require_parent = False
+
+	class Media:
+		js = resolve_dependencies('shop/js/admin/shoplinkplugin.js')
+
+	@classmethod
+	def get_link(cls, obj):
+		link = obj.glossary.get('link', {})
+		if link.get('type') == 'cmspage':
+			if 'model' in link and 'pk' in link:
+				if not hasattr(obj, '_link_model'):
+					Model = apps.get_model(*link['model'].split('.'))
+					try:
+						obj._link_model = Model.objects.geet(pk=link['pk'])
+					except Model.DoesNotExist:
+						obj._link_model = None
+				if obj._link_model:
+					return obj._link_model.get_absolute_url()
+		else:
+			return link.get('type')
+
+	def get_ring_bases(self):
+		bases = super(ShopLinkPluginBase, self).get_ring_bases()
+		bases.append('LinkPluginBase')
+		return bases
+
+
+class ShopButtonPluginBase(ShopLinkPluginBase):
+	fields = ('link_content', ('link_type', 'cms_page', 'section'), 'glossary')
+
+	class Media:
+		css = {'all': ('cascade/css/admin/bootstrap.min.css', 'cascade/css/admin/bootstrap-theme.min.css')}
+
+
+	@classmethod
+	def get_identifier(cls, instance):
+		return mark_safe(instance.glossary.get('link_content', ''))
+
+
+class ProductSelect2Widget(HeavySelect2Widget):
+	def render(self, name, value, attrs=None, choices=None):
+		try:
+			result = ProductSelectSerializer(ProductModel.objects.get(pk=value))
+			choices = (value, result.data['text'])
+		except (ProductModel.DoesNotExist, ValueError):
+			choices = ()
+		html = super(ProductSelect2Widget, self).render(name, value, attrs=attrs, choices=choices)
+		print(html)
+		return html
+
+
+class ProductSelectField(ChoiceField):
+	def __init__(self, *args, **kwargs):
+		kwargs.setdefault('widget', ProductSelect2Widget(data_view='shop:select-product'))
+		super(ProductSelectField, self).__init__(*args, **kwargs)
+
+	def clean(self, value):
+		try:
+			return int(value)
+		except (TypeError, ValueError):
+			pass
+
+
+class CatalogLinkForm(LinkForm):
+	LINK_TYPE_CHOICES = (('cmspage', _("CMS Page")), ('product', _("Product")),
+						('exturl', _("External URL")), ('email', _("Mail To")))
+	product = ProductSelectField(required=False, label='',
+		help_text=_("An internal link onto a product from the shop"))
+
+	def clean_product(self):
+		if self.cleaned_data.get('link_type') == 'product':
+			app_label = ProductModel._meta_app_label
+			self.cleaned_data['link_data'] = {
+				'type': 'product',
+				'model': '{0}.{1}'.format(app_label, ProductModel.__name__),
+				'pk': self.cleaned_data['product']
+			}
+
+	def set_initial_product(self, initial):
+		try:
+			Model = apps.get_model(*initial['link']['model'].split('.'))
+			initial['product'] = Model.objects.get(pk=initial['link']['pk']).pk
+		except (KeyError, ValueError, ObjectDoesNotExist):
+			pass
+
+
+class CatalogLinkPluginBase(LinkPluginBase):
+	fields = (('link_type', 'cms_page', 'section', 'product', 'ext_url', 'mail_to'), 'glossary')
+
+	class Media:
+		css = {'all': ('shop/css/admin/editplugin.css')}
+		js = resolve_dependencies('shop/js/admin/shoplinkplugin.js')
+
+
+class DialogFormPluginBase(ShopPluginBase):
+	require_parent = True
+	parent_classes = ('BootstrapColumnPlugin', 'ProcessStepPlugin', 'BootstrapPanelPlugin',
+		'SegmentPlugin', 'SimpleWrapperPlugin', 'ValidateSetOfFormsPlugin')
+	CHOICES = (('form', _("Form dialog")), ('summary', _("Static summary")))
+	render_type = GlossaryField(
+		widgets.RadioSelect(choices=CHOICES),
+		label=_("Render as"),
+		initial='form',
+		help_text=_("A dialog can also be rendered as a box containing a read-only summary.")
+	)
+
+	@classmethod
+	def register_plugin(cls, plugin):
+		if not issubclass(plugin, cls):
+			msg = "Can not register plugin class `{}`, since is does not inherit from `{}`."
+			raise ImproperlyConfigured(msg.format(plugin.__name__, cls.__name__))
+		if plugin.get_form_class() is None:
+			msg = "Can not register plugin class `{}`, since is does not define a `form_class`."
+			raise ImproperlyConfigured(msg.format(plugin.__name__))
+		plugin_pool.register_plugin(plugin)
+
+	@classmethod
+	def get_form_class(cls):
+		return getattr(cls, 'form_class', None)
+
+	@classmethod
+	def get_identifier(cls, instance):
+		render_type = instance.glossary.get('render_type')
+		render_type = dict(cls.CHOICES).get(render_type, '')
+		return format_html(pgettext_lazy('get_identifier', "as {}"), render_type)
+
+	def __init__(self, *args, **kwargs):
+		super(DialogFormPluginBase, self).__init__(*args, **kwargs)
+		self.FormClass = import_string(self.get_form_class())
+
+	def get_form_data(self, context, instance, placeholder):
+		if issubclass(self.FormClass, DialogFormMixin):
+			try:
+				cart = CartModel.objects.get_from_request(context['request'])
+				cart.update(context['request'])
+			except CartModel.DoesNotExist:
+				cart = None
+			return {'cart': cart}
+		return {}
+
+	def get_render_template(self, context, instance, placeholder):
+		render_type = instance.glossary.get('render_type')
+		if render_type not in ('form', 'summary'):
+			render_type = 'form'
+		try:
+			template_names = [
+				'{0}/checkout/{1}'.format(shop_settings.APP_LABEL, self.template_leaf_name).format(render_type),
+				'shop/checkout/{}'.format(self.template_leaf_name).format(render_type),
+			]
+			return select_template(template_names)
+		except (AttributeError, TemplateDoesNotExist):
+			return self.render_template
+
+	def render(self, context, instance, placeholder):
+		request = context['request']
+		form_data = self.get_form_data(context, instance, placeholder)
+		request._plugin_order = getattr(request, '_plugin_order', 0) + 1
+		if not isinstance(form_data.get('initial'), dict):
+			form_data['initial'] = {}
+		form_data['initial'].update(plugin_id=instance.id, plugin_order=request._plugin_order)
+		bound_form = self.FormClass(**form_data)
+		context[bound_form.form_name] = bound_form
+		return super(DialogFormPluginBase, self).render(context, instance, placeholder)
